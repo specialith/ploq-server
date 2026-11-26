@@ -1,0 +1,23 @@
+{
+  "name": "ploq-server",
+  "private": true,
+  "description": "Ploq sync server: real-time collaboration for MuseScore. A Cloudflare Worker with Durable Objects, D1 and R2.",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --port 8799 --ip 127.0.0.1 --persist-to .wrangler/local --var DEV_TOOLS:1 --var PUBLIC_ORIGIN:http://127.0.0.1:8799",
+    "migrate:local": "wrangler d1 migrations apply DB --local --persist-to .wrangler/local",
+    "relay": "node relay/server.mjs 8787",
+    "deploy": "wrangler deploy && wrangler d1 migrations apply DB --remote",
+    "migrate": "wrangler d1 migrations apply DB --remote",
+    "test": "node test/protocol.test.mjs",
+    "test:unit": "node --test \"test/unit/**/*.test.mjs\"",
+    "test:server": "node scripts/test-fresh.mjs --test test/selfhost.test.mjs --port 8799 --url-var SELFHOST_URL",
+    "test:protocol:dev": "node -e \"process.env.COLLAB_TEST_URL='ws://127.0.0.1:8799'; import('./test/protocol.test.mjs')\"",
+    "test:worker": "node scripts/test-fresh.mjs --test test/protocol.test.mjs --port 8799 --url-var COLLAB_TEST_URL"
+  },
+  "devDependencies": {
+    "wrangler": "4.167.0",
+    "ws": "^8.23.0"
+  }
+}

@@ -1,0 +1,46 @@
+{
+	// Ploq server, self-hosted. One Durable Object ("Room") per shared score, accounts,
+	// scores and invites in D1, saved scores in R2, the website from ./public.
+	// `npm run deploy` (or the Deploy to Cloudflare button in the README) creates the
+	// database and bucket on first deploy, applies the migrations, and gives you a
+	// https://<name>.<your-subdomain>.workers.dev address. See README.md.
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "ploq-server",
+	"main": "src/index.js",
+	// The website's static files (app.css, app.js, fonts, images). Paths that
+	// aren't files here go to the Worker (page shells, API, rooms).
+	"assets": { "directory": "./public", "binding": "ASSETS" },
+	"compatibility_date": "2026-10-01",
+	"durable_objects": {
+		"bindings": [
+			{ "name": "ROOMS", "class_name": "Room" }
+		]
+	},
+	"migrations": [
+		// SQLite-backed Durable Objects: required on the Workers Free plan.
+		{ "tag": "v1", "new_sqlite_classes": ["Room"] }
+	],
+	"d1_databases": [
+		// No database_id: wrangler creates the database on the first deploy.
+		{ "binding": "DB", "database_name": "ploq", "migrations_dir": "migrations" }
+	],
+	"r2_buckets": [
+		// Created on the first deploy too. R2 must be enabled on your Cloudflare account.
+		{ "binding": "SCORES", "bucket_name": "ploq-scores" }
+	],
+	// Rate limits (approximate, per Cloudflare location; period must be 10 or 60 s).
+	// The ids are any numbers not used by another Worker on your account.
+	"ratelimits": [
+		// Sign-ups per IP address.
+		{ "name": "SIGNUP_LIMITER", "namespace_id": "2001", "simple": { "limit": 5, "period": 60 } },
+		// "Open in Ploq" code previews/redemptions per IP address.
+		{ "name": "LOGIN_LIMITER", "namespace_id": "2002", "simple": { "limit": 20, "period": 60 } },
+		// Changes (share, upload, invites, ...) per signed-in person.
+		{ "name": "WRITE_LIMITER", "namespace_id": "2003", "simple": { "limit": 30, "period": 60 } }
+	],
+	// Name sign-in, and invite links on this Worker's own address. To use your own domain: add it under the Worker's
+	// Settings > Domains & Routes in the Cloudflare dashboard, then set
+	// "vars": { "PUBLIC_ORIGIN": "https://your.domain" } here and deploy again.
+	"workers_dev": true,
+	"observability": { "enabled": true }
+}
