@@ -30,7 +30,7 @@ Ploq logo from what people see. You can still describe it as based on Ploq.
 ## Questions
 
 For anything this doesn't cover, or to ask for permission, open an issue in this repository or
-reply to any email from Ploq.
+email support@ploq.app.
 
 Ploq is based on MuseScore Studio and is not affiliated with Muse Group. MuseScore is a
 trademark of Muse Group; this policy covers only Ploq's own name and logo.
