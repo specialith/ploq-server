@@ -369,6 +369,28 @@ try {
         const closeCode = await Promise.race([closed, new Promise(r => setTimeout(() => r("still open"), 10000))]);
         check(kick.status === 200 && closeCode === 4003, "#5 removing a member disconnects them from the live score");
         check(await refused(connect(tokens.Carol)) === 403, "#5 ...and they can't reconnect");
+        check((await api(`/api/invites/${inviteUrl.split("/").pop()}`)).status === 404,
+              "#5 removing a member also turns off the invite links (no way back in through an old link)");
+
+        // A connection that floods is limited: messages pass in a burst of 120, then 20 a second.
+        fa.inbox.length = 0;
+        fb.inbox.length = 0;
+        for (let i = 0; i < 400; i++) {
+            fb.ws.send(JSON.stringify({ type: "cursor", page: 0, x: i, y: 0 }));
+        }
+        // ...and an edit in the middle of the flood is refused out loud ("slow down"), never dropped silently.
+        fb.ws.send(JSON.stringify({ type: "edit", editId: 777, tickFrom: 0, tickTo: 1920, staffFrom: 0, staffTo: 1, xml: "<x/>" }));
+        await new Promise(r => setTimeout(r, 1500));
+        const passed = fa.inbox.filter(m => m.type === "cursor").length;
+        check(passed >= 100 && passed < 300, `a flood of 400 cursor messages is cut to ${passed} (rate limit)`);
+        const slow = await waitFor(fb.inbox, m => (m.type === "edit-rejected" || m.type === "ack") && m.editId === 777);
+        check(slow.type === "edit-rejected" && slow.reason === "slow down", "an edit sent while flooding gets edit-rejected 'slow down'");
+        await new Promise(r => setTimeout(r, 7000)); // let the bucket refill
+        fa.inbox.length = 0;
+        fb.ws.send(JSON.stringify({ type: "cursor", page: 0, x: 0, y: 0, pad: "x".repeat(70 * 1024) }));
+        fb.ws.send(JSON.stringify({ type: "cursor", page: 0, x: 7, y: 7 }));
+        await waitFor(fa.inbox, m => m.type === "cursor" && m.x === 7);
+        check(!fa.inbox.some(m => m.type === "cursor" && m.pad), "an oversized cursor message (70 KB) isn't passed on; normal ones are");
         const bobKick = await api(`/api/projects/${mainProjectId}/members/${userIds.Alice}`, { method: "DELETE", token: tokens.Bob });
         check(bobKick.status === 403, "#5 an editor can't remove people");
 

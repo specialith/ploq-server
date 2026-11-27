@@ -58,7 +58,9 @@ route(/^\/open\/(p_[0-9a-f]{24})$/, async (id) => {
     if (!me) {
         return;
     }
-    if (!/Windows/.test(navigator.userAgent)) {
+    // Ploq is a desktop app (Windows, macOS, Linux): on a phone or tablet say so; on any computer try
+    // the ploq:// link (if Ploq isn't installed, the page below offers the download and a second try).
+    if (/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)) {
         const project = await api(`/api/projects/${id}`);
         if (!project.ok) {
             render("Open in Ploq", title("Can't open this score", "long"), el("p", { class: "copy" }, project.data.error), backToScores());
@@ -66,7 +68,7 @@ route(/^\/open\/(p_[0-9a-f]{24})$/, async (id) => {
         }
         render("Open in Ploq",
             title(project.data.title || "Untitled score", "long"),
-            el("p", { class: "copy" }, "Ploq runs on Windows. Open this score on a Windows PC."),
+            el("p", { class: "copy" }, "Ploq is a desktop app for Windows, macOS and Linux. Open this score on your computer."),
             backToScores());
         return;
     }

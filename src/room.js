@@ -3,7 +3,7 @@
 // 2026-11-25: the edit order (seq) decides who wins a measure.
 
 import { DurableObject } from "cloudflare:workers";
-import { base64ToBytes, bytesToBase64, scoreKey } from "./http.js";
+import { base64ToBytes, bytesToBase64, scoreKey, cleanName } from "./http.js";
 
 const shortId = (id) => String(id || "").replace(/^[up]_/, "").slice(0, 6);
 
@@ -11,6 +11,18 @@ const MAX_SNAPSHOT_B64 = 24 * 1024 * 1024;  // ~18 MB score
 const MAX_STORED_EDIT = 1_800_000;          // DO storage values must stay under 2 MB
 const COMPACT_AFTER_EDITS = 300;            // then ask for a fresh snapshot
 const MAX_PENDING_EDITS = 2000;             // refuse edits until a snapshot arrives
+const MAX_PENDING_BYTES = 32 * 1024 * 1024; // ...or once the stored edits add up to this much
+// Per-connection limits (the app sends cursors twice a second, edits and selections per keystroke).
+// Without them one connection could burn the whole service's daily storage writes.
+const RATE_BURST = 120;                     // messages a connection may send at once (a reconnect flushes held edits)...
+const RATE_PER_SEC = 20;                    // ...refilled at this rate
+const EDIT_BURST = 120;                     // edits (2 storage writes each) at once...
+const EDIT_PER_SEC = 5;                     // ...and sustained: protects the daily storage-write budget
+const RATE_CLOSE_AFTER_DROPS = 500;         // dropped messages before the connection is closed
+const MAX_PRESENCE_MSG = 64 * 1024;         // cursor / selection messages (a big select-all fits)
+const SNAPSHOT_BURST = 10;                  // accepted snapshots / structure changes a connection may send at once...
+const SNAPSHOT_REFILL_MS = 3000;            // ...then one more every 3 s (each writes the whole score to R2)
+const SYNC_PAGE = 100;                      // edits read per page when bringing a client up to date
 
 const editKey = (seq) => `edit:${String(seq).padStart(12, "0")}`;
 
@@ -18,7 +30,10 @@ export class Room extends DurableObject {
     constructor(ctx, env) {
         super(ctx, env);
         // Room-wide counters; persisted, reloaded after the object sleeps.
-        this.meta = { seq: 0, nextClientId: 1, baseSeq: 0, hasSnapshot: false, title: "", projectId: "", lastCompactAsk: 0 };
+        this.meta = { seq: 0, nextClientId: 1, baseSeq: 0, hasSnapshot: false, title: "", projectId: "", lastCompactAsk: 0,
+                      pendingBytes: 0 };
+        // Per-connection rate state, in memory only (a sleeping room has no traffic to limit).
+        this.rates = new Map();
         ctx.blockConcurrencyWhile(async () => {
             const saved = await ctx.storage.get("meta");
             if (saved) {
@@ -78,7 +93,8 @@ export class Room extends DurableObject {
                 }
             }
             await this.ctx.storage.deleteAll();
-            this.meta = { seq: 0, nextClientId: 1, baseSeq: 0, hasSnapshot: false, title: "", projectId: "", lastCompactAsk: 0 };
+            this.meta = { seq: 0, nextClientId: 1, baseSeq: 0, hasSnapshot: false, title: "", projectId: "", lastCompactAsk: 0,
+                          pendingBytes: 0 };
             return new Response("ok");
         }
 
@@ -165,6 +181,13 @@ export class Room extends DurableObject {
         if (!msg || typeof msg !== "object" || Array.isArray(msg)) {
             return;
         }
+        if (!this.allow(ws)) {
+            // Never drop an edit silently: the app puts a "slow down" edit back in its outbox and resends it.
+            if (msg.type === "edit") {
+                this.send(ws, { type: "edit-rejected", editId: msg.editId, reason: "slow down" });
+            }
+            return;
+        }
         const me = this.info(ws);
 
         switch (msg.type) {
@@ -188,12 +211,17 @@ export class Room extends DurableObject {
             break; // apps from before 2026-11-25 still send their selection as a lock: ignored
 
         case "edit": {
+            if (!this.allowEdit(ws)) {
+                this.send(ws, { type: "edit-rejected", editId: msg.editId, reason: "slow down" });
+                break;
+            }
             // No locks: the order given here (seq) decides who wins a measure.
             // Don't let the edit log grow without bound: a client that never
             // answers snapshot-request gets its edits refused until one arrives.
-            if (this.meta.seq - this.meta.baseSeq >= MAX_PENDING_EDITS) {
+            if (this.meta.seq - this.meta.baseSeq >= MAX_PENDING_EDITS || (this.meta.pendingBytes || 0) >= MAX_PENDING_BYTES) {
                 this.send(ws, { type: "edit-rejected", editId: msg.editId, reason: "too many edits since the last saved score" });
-                this.send(ws, { type: "snapshot-request" });
+                // Anyone connected can save the score, not only this sender (who may never answer).
+                this.broadcast({ type: "snapshot-request" });
                 break;
             }
             this.meta.seq += 1;
@@ -202,6 +230,7 @@ export class Room extends DurableObject {
             const storable = text.length <= MAX_STORED_EDIT;
             if (storable) {
                 await this.ctx.storage.put(editKey(out.seq), text);
+                this.meta.pendingBytes = (this.meta.pendingBytes || 0) + text.length;
             }
             await this.saveMeta();
             this.broadcast(out, ws);
@@ -217,7 +246,13 @@ export class Room extends DurableObject {
         }
 
         case "snapshot-put":
-            await this.putSnapshot(ws, msg);
+            if (!this.allowSnapshot(ws)) {
+                this.send(ws, { type: "snapshot-refused", reason: "too soon after the last one" });
+                break;
+            }
+            if (await this.putSnapshot(ws, msg)) {
+                this.markSnapshot(ws);
+            }
             break;
 
         case "structure":
@@ -225,7 +260,13 @@ export class Room extends DurableObject {
             // travel as a measure paste, so the sender's whole score becomes
             // the room's score - as a numbered step in the edit order - and
             // everyone else reloads it.
-            await this.putSnapshot(ws, msg, me);
+            if (!this.allowSnapshot(ws)) {
+                this.send(ws, { type: "edit-rejected", editId: msg.editId, reason: "too soon after the last structure change" });
+                break;
+            }
+            if (await this.putSnapshot(ws, msg, me)) {
+                this.markSnapshot(ws);
+            }
             break;
 
         case "sync":
@@ -237,6 +278,9 @@ export class Room extends DurableObject {
             // The only client messages passed on to others. Anything else a
             // client sends is dropped, so nobody can forge server messages
             // (snapshot, welcome, presence...) to other members.
+            if (data.length > MAX_PRESENCE_MSG) {
+                break;
+            }
             this.broadcast({ ...msg, type: msg.type, from: me.id, name: me.name }, ws);
             break;
 
@@ -258,25 +302,25 @@ export class Room extends DurableObject {
         if (!data || data.length > MAX_SNAPSHOT_B64 || !Number.isFinite(baseSeq) || baseSeq < 0 || baseSeq > maxSeq
             || !this.meta.projectId) {
             this.send(ws, { type: "snapshot-refused" });
-            return;
+            return false;
         }
         if (this.meta.hasSnapshot && baseSeq < this.meta.baseSeq) {
             this.send(ws, { type: "snapshot-refused", reason: "older than the one we have" });
-            return;
+            return false;
         }
         let bytes;
         try {
             bytes = base64ToBytes(data);
         } catch {
             this.send(ws, { type: "snapshot-refused", reason: "not base64" });
-            return;
+            return false;
         }
         // A real .mscz is a zip file ("PK").
         if (bytes.length < 4 || bytes[0] !== 0x50 || bytes[1] !== 0x4b) {
             this.send(ws, { type: "snapshot-refused", reason: "not an .mscz file" });
-            return;
+            return false;
         }
-        const title = typeof msg.title === "string" && msg.title ? msg.title.slice(0, 128) : this.meta.title;
+        const title = typeof msg.title === "string" && msg.title ? (cleanName(msg.title, 128) || this.meta.title) : this.meta.title;
         await this.env.SCORES.put(scoreKey(this.meta.projectId), bytes, {
             httpMetadata: { contentType: "application/x-musescore" },
             customMetadata: { baseSeq: String(baseSeq), title },
@@ -284,6 +328,11 @@ export class Room extends DurableObject {
 
         const old = await this.ctx.storage.list({ prefix: "edit:", end: editKey(baseSeq + 1) });
         const stale = [...old.keys()];
+        let staleBytes = 0;
+        for (const v of old.values()) {
+            staleBytes += typeof v === "string" ? v.length : 0;
+        }
+        this.meta.pendingBytes = Math.max(0, (this.meta.pendingBytes || 0) - staleBytes);
         for (let i = 0; i < stale.length; i += 128) {
             await this.ctx.storage.delete(stale.slice(i, i + 128));
         }
@@ -295,8 +344,14 @@ export class Room extends DurableObject {
             this.meta.seq = baseSeq;
         }
         await this.saveMeta();
-        await this.env.DB.prepare("UPDATE projects SET title = ?, updated_at = ? WHERE id = ?")
-            .bind(title, Date.now(), this.meta.projectId).run();
+        // One D1 write per new title or per minute, not per snapshot (D1 writes are a daily budget).
+        const now = Date.now();
+        if (title !== this.lastDbTitle || now - (this.lastDbWrite || 0) >= 60_000) {
+            this.lastDbTitle = title;
+            this.lastDbWrite = now;
+            await this.env.DB.prepare("UPDATE projects SET title = ?, updated_at = ? WHERE id = ?")
+                .bind(title, now, this.meta.projectId).run();
+        }
 
         if (structureFrom) {
             this.broadcast({ type: "snapshot", reload: true, baseSeq, title, data, from: structureFrom.id,
@@ -305,6 +360,7 @@ export class Room extends DurableObject {
         } else {
             this.send(ws, { type: "snapshot-saved", baseSeq });
         }
+        return true;
     }
 
     //! Bring a client up to date: the edits after `sinceSeq`, or — if it has
@@ -321,18 +377,89 @@ export class Room extends DurableObject {
             this.send(ws, { type: "snapshot", baseSeq: this.meta.baseSeq, title: this.meta.title, data: bytesToBase64(bytes) });
             from = this.meta.baseSeq;
         }
-        const edits = await this.ctx.storage.list({ prefix: "edit:", start: editKey(from + 1) });
-        for (const text of edits.values()) {
-            try {
-                ws.send(text);
-            } catch {
-                return;
+        // In pages: the log can hold up to MAX_PENDING_BYTES, too much to load at once.
+        let start = editKey(from + 1);
+        for (;;) {
+            const page = await this.ctx.storage.list({ prefix: "edit:", start, limit: SYNC_PAGE });
+            let last = null;
+            for (const [key, text] of page) {
+                try {
+                    ws.send(text);
+                } catch {
+                    return;
+                }
+                last = key;
             }
+            if (page.size < SYNC_PAGE || last === null) {
+                break;
+            }
+            start = last + "\u0000"; // the first key after the last one sent
         }
         this.send(ws, { type: "synced", seq: this.meta.seq });
     }
 
+    //! Token bucket per connection; a connection that keeps flooding is closed.
+    allow(ws) {
+        const now = Date.now();
+        let r = this.rates.get(ws);
+        if (!r) {
+            r = { tokens: RATE_BURST, at: now, drops: 0, snapTokens: SNAPSHOT_BURST, snapAt: now, editTokens: EDIT_BURST, editAt: now };
+            this.rates.set(ws, r);
+        }
+        r.tokens = Math.min(RATE_BURST, r.tokens + ((now - r.at) / 1000) * RATE_PER_SEC);
+        r.at = now;
+        if (r.tokens >= 1) {
+            r.tokens -= 1;
+            return true;
+        }
+        r.drops += 1;
+        if (r.drops >= RATE_CLOSE_AFTER_DROPS) {
+            try {
+                ws.close(1008, "too many messages");
+            } catch {
+                // already closed
+            }
+        }
+        return false;
+    }
+
+    allowEdit(ws) {
+        const r = this.rates.get(ws);
+        if (!r) {
+            return true;
+        }
+        const now = Date.now();
+        r.editTokens = Math.min(EDIT_BURST, r.editTokens + ((now - r.editAt) / 1000) * EDIT_PER_SEC);
+        r.editAt = now;
+        if (r.editTokens >= 1) {
+            r.editTokens -= 1;
+            return true;
+        }
+        return false;
+    }
+
+    //! Snapshots and structure changes write the whole score to R2: a small budget per connection
+    //! (SNAPSHOT_BURST, refilled every SNAPSHOT_REFILL_MS). Refused ones (bad data) write nothing and don't count.
+    allowSnapshot(ws) {
+        const r = this.rates.get(ws);
+        if (!r) {
+            return true;
+        }
+        const now = Date.now();
+        r.snapTokens = Math.min(SNAPSHOT_BURST, r.snapTokens + (now - r.snapAt) / SNAPSHOT_REFILL_MS);
+        r.snapAt = now;
+        return r.snapTokens >= 1;
+    }
+
+    markSnapshot(ws) {
+        const r = this.rates.get(ws);
+        if (r) {
+            r.snapTokens -= 1;
+        }
+    }
+
     async webSocketClose(ws, code, reason) {
+        this.rates.delete(ws);
         try {
             ws.close(code, reason);
         } catch {

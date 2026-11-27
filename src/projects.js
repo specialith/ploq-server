@@ -200,11 +200,14 @@ export async function handleProjects({ request, env, config, user, url, path, me
                 return fail(400, "You own this score. Delete it instead.");
             }
             await env.DB.prepare("DELETE FROM members WHERE project_id = ? AND user_id = ?").bind(projectId, mm[1]).run();
+            // Their invite link would let them straight back in: turn the score's links off. The owner
+            // makes a new one for the people they still want to invite.
+            await env.DB.prepare("DELETE FROM invites WHERE project_id = ?").bind(projectId).run();
             const project = await env.DB.prepare("SELECT room FROM projects WHERE id = ?").bind(projectId).first();
             if (project) {
                 await roomStub(env, project.room).fetch("https://room/kick", { method: "POST", headers: { "X-Collab-User-Id": mm[1] } });
             }
-            return json({});
+            return json({ invitesRevoked: true });
         }
 
         if (sub === "" && method === "DELETE") {
