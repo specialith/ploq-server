@@ -6,7 +6,7 @@
 // The website (site.js + public/) is served from the same address.
 //
 // HTTP API (JSON; "*" = signed in: the app sends "Authorization: Bearer <token>", the website a cookie):
-//   POST   /api/signup                {name, invite?} -> {userId, name, token}  (sets cookie)
+//   POST   /api/signup                {name, invite?, setupCode?} -> {userId, name, token}  (sets cookie)
 //   POST   /api/signout                    *        -> {} (this sign-in stops working)
 //   GET    /api/me                          *        -> {userId, name, mode, authMethods}
 //                                                     (signed out: 401 {error, mode, authMethods}, for the sign-in page)
@@ -142,12 +142,12 @@ export function createApp(ext = {}) {
                 const hash = await sha256Hex(m[1]);
                 const expired = fail(404, "This link has expired. Click \"Open in Ploq\" on the website again.");
                 if (method === "GET") {
-                    // u.*: the preview includes the account's email where the database has one.
+                    // No sign-in is needed to ask, so the preview says only who (name, short id), never the email.
                     const row = await env.DB.prepare(
-                        "SELECT u.*, p.title AS project_title FROM login_codes c JOIN users u ON u.id = c.user_id "
+                        "SELECT u.id, u.name, p.title AS project_title FROM login_codes c JOIN users u ON u.id = c.user_id "
                         + "LEFT JOIN projects p ON p.id = c.project_id WHERE c.code_hash = ? AND c.expires_at >= ? "
                         + "AND (c.purpose = 'app' OR (c.purpose = 'open' AND p.id IS NOT NULL))").bind(hash, Date.now()).first();
-                    return row ? json({ name: row.name, email: row.email, accountId: shortId(row.id), title: row.project_title || null }) : expired;
+                    return row ? json({ name: row.name, accountId: shortId(row.id), title: row.project_title || null }) : expired;
                 }
                 const now = Date.now();
                 const peek = await env.DB.prepare(

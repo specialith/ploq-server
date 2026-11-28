@@ -1,0 +1,7 @@
+# The Worker's secrets. The Deploy to Cloudflare button asks for these while deploying.
+# From a terminal: npx wrangler secret put SETUP_CODE
+# For local development (npm run dev), copy this file to .dev.vars.
+
+# Needed once: the first person to sign in on a new server types it and becomes the owner.
+# 8 characters or more. After that it does nothing.
+SETUP_CODE=choose-a-code-only-you-know

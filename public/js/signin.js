@@ -7,8 +7,9 @@ import { el, api, getMe, safeReturnPath, here, signInUrl, render, title, message
 const NEEDS_INVITE = "You need an invite link to join this server.";
 
 // --- Sign in (/signin?return=) ----------------------------------------------------
-// By name. The first account on a server is its owner; after that, a new account needs an
-// invite link (coming from an invite page, its code goes along).
+// By name. The first account on a server is its owner and needs the setup code chosen when the
+// server was deployed (the field appears when the server asks for it); after that, a new account
+// needs an invite link (coming from an invite page, its code goes along).
 
 route(/^\/signin$/, async () => {
     const params = new URLSearchParams(location.search);
@@ -24,6 +25,8 @@ route(/^\/signin$/, async () => {
     }
     const invite = (returnTo.match(/^\/j\/([0-9a-f]{24})$/) || [])[1];
     const nameField = field("Your name", { type: "text", name: "name", autocomplete: "name", maxlength: "40", required: true });
+    const setupField = field("Setup code", { type: "password", name: "setup-code", autocomplete: "off", maxlength: "200" });
+    setupField.hidden = true;
     const msg = message();
     render("Sign in",
         title("Sign in to Ploq"),
@@ -36,13 +39,22 @@ route(/^\/signin$/, async () => {
                     return;
                 }
                 msg.show("");
-                const r = await api("/api/signup", { method: "POST", body: invite ? { name, invite } : { name } });
+                const setupCode = setupField.hidden ? "" : setupField.input.value.trim();
+                const r = await api("/api/signup", { method: "POST",
+                    body: { name, ...(invite ? { invite } : {}), ...(setupCode ? { setupCode } : {}) } });
                 if (!r.ok) {
-                    msg.show(r.status === 403 ? NEEDS_INVITE : r.data.error, true);
+                    if (r.status === 403 && r.data.setup === "needed") {
+                        // A new server: its first account (the owner) needs the setup code.
+                        setupField.hidden = false;
+                        msg.show(r.data.error, true);
+                        setupField.input.focus();
+                        return;
+                    }
+                    msg.show(r.status === 403 && !r.data.setup ? NEEDS_INVITE : r.data.error, true);
                     return;
                 }
                 location.replace(returnTo);
-            }, nameField, el("p", { class: "note" }, "People you share scores with see this name."), submit("Continue"), msg),
+            }, nameField, el("p", { class: "note" }, "People you share scores with see this name."), setupField, submit("Continue"), msg),
             el("p", { class: "note" },
                 "Already have an account? On a computer where you're signed in, open Your scores and choose Sign in on another computer.")));
     nameField.input.focus();

@@ -4,6 +4,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { base64ToBytes, bytesToBase64, scoreKey, cleanName } from "./http.js";
+import { cleanPresence } from "./presence.js";
 
 const shortId = (id) => String(id || "").replace(/^[up]_/, "").slice(0, 6);
 
@@ -224,20 +225,24 @@ export class Room extends DurableObject {
                 this.broadcast({ type: "snapshot-request" });
                 break;
             }
-            this.meta.seq += 1;
-            const out = { ...msg, seq: this.meta.seq, from: me.id, name: me.name };
+            // Every numbered edit must be in the log, or a client catching up later would skip it
+            // without knowing. One too big to store is refused before it gets a number; the app
+            // sends that change as a whole score (structure) instead.
+            const out = { ...msg, seq: this.meta.seq + 1, from: me.id, name: me.name };
             const text = JSON.stringify(out);
-            const storable = text.length <= MAX_STORED_EDIT;
-            if (storable) {
-                await this.ctx.storage.put(editKey(out.seq), text);
-                this.meta.pendingBytes = (this.meta.pendingBytes || 0) + text.length;
+            if (text.length > MAX_STORED_EDIT) {
+                this.send(ws, { type: "edit-rejected", editId: msg.editId, reason: "too big" });
+                break;
             }
+            this.meta.seq = out.seq;
+            await this.ctx.storage.put(editKey(out.seq), text);
+            this.meta.pendingBytes = (this.meta.pendingBytes || 0) + text.length;
             await this.saveMeta();
             this.broadcast(out, ws);
             this.send(ws, { type: "ack", seq: out.seq, editId: msg.editId });
 
             const pending = this.meta.seq - this.meta.baseSeq;
-            if (!storable || (pending >= COMPACT_AFTER_EDITS && this.meta.seq - this.meta.lastCompactAsk >= 50)) {
+            if (pending >= COMPACT_AFTER_EDITS && this.meta.seq - this.meta.lastCompactAsk >= 50) {
                 this.meta.lastCompactAsk = this.meta.seq;
                 await this.saveMeta();
                 this.send(ws, { type: "snapshot-request" });
@@ -250,7 +255,7 @@ export class Room extends DurableObject {
                 this.send(ws, { type: "snapshot-refused", reason: "too soon after the last one" });
                 break;
             }
-            if (await this.putSnapshot(ws, msg)) {
+            if (await this.atomically(() => this.putSnapshot(ws, msg))) {
                 this.markSnapshot(ws);
             }
             break;
@@ -264,29 +269,51 @@ export class Room extends DurableObject {
                 this.send(ws, { type: "edit-rejected", editId: msg.editId, reason: "too soon after the last structure change" });
                 break;
             }
-            if (await this.putSnapshot(ws, msg, me)) {
+            if (await this.atomically(() => this.putSnapshot(ws, msg, me))) {
                 this.markSnapshot(ws);
             }
             break;
 
         case "sync":
-            await this.sync(ws, Number.isFinite(msg.sinceSeq) ? msg.sinceSeq : -1);
+            await this.atomically(() => this.sync(ws, Number.isFinite(msg.sinceSeq) ? msg.sinceSeq : -1));
             break;
 
         case "cursor":
-        case "selection":
+        case "selection": {
             // The only client messages passed on to others. Anything else a
             // client sends is dropped, so nobody can forge server messages
-            // (snapshot, welcome, presence...) to other members.
+            // (snapshot, welcome, presence...) to other members. Only the
+            // fields the apps use go on, checked (see presence.js).
             if (data.length > MAX_PRESENCE_MSG) {
                 break;
             }
-            this.broadcast({ ...msg, type: msg.type, from: me.id, name: me.name }, ws);
+            const clean = cleanPresence(msg);
+            if (clean) {
+                this.broadcast({ ...clean, from: me.id, name: me.name }, ws);
+            }
             break;
+        }
 
         default:
             break;
         }
+    }
+
+    //! Runs fn with no other message handled in between. Storage calls already hold other messages
+    //! back, but R2 calls don't: without this, an edit arriving while a structure change was being
+    //! written to R2 could take the same edit number, two snapshots could finish out of order (the
+    //! older one winning, and the edits between them deleted), and a client catching up could get a
+    //! live edit before the score it applies to.
+    //! A failure is logged and answers false: one thrown out of blockConcurrencyWhile resets the whole room.
+    atomically(fn) {
+        return this.ctx.blockConcurrencyWhile(async () => {
+            try {
+                return await fn();
+            } catch (e) {
+                console.error("room:", e && e.stack || e);
+                return false;
+            }
+        });
     }
 
     //! A client's full score → R2 (scores/<projectId>.mscz); drop the edits it already contains.

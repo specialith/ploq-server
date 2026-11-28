@@ -1,11 +1,16 @@
-// Sign-in: by name. The first account on a server is free (it's the owner); after that, a new
-// account needs a valid invite link. Also sign-out, and device links (a one-time link from a
+// Sign-in: by name. The first account on a server is its owner and needs the server's setup code
+// (the SETUP_CODE secret set when deploying), so whoever finds a new server first can't take it;
+// after that, a new account needs a valid invite link. Also sign-out, and device links (a one-time link from a
 // signed-in browser that signs another browser in to the same account).
 
 import { json, fail, randomHex, sha256Hex, cleanName, readJson, allowed, clientIp } from "./http.js";
 import { startSession, withCookie, clearedCookie, createUserWithSession } from "./session.js";
 
 export const NEEDS_INVITE = "You need an invite link to join this server.";
+export const NEEDS_SETUP_CODE = "This server has no owner yet. Type the setup code you chose when you deployed it.";
+export const NO_SETUP_CODE = "This server has no owner yet, and no setup code is set. Whoever deployed it: set the SETUP_CODE "
+    + "secret (8 characters or more) in the Cloudflare dashboard, then sign in with it.";
+const MIN_SETUP_CODE = 8;
 const DEVICE_LINK_MINUTES = 15;
 
 //! The live invite with this code ({project_id}), or null.
@@ -16,8 +21,23 @@ export async function validInvite(env, code) {
         : null;
 }
 
-//! POST /api/signup {name, invite?}: name sign-in. The first account is free; after that you need
-//! a valid invite code (and you join its score).
+//! Whether `given` is the server's setup code, compared without leaking where they differ.
+async function isSetupCode(env, given) {
+    const code = typeof env.SETUP_CODE === "string" ? env.SETUP_CODE.trim() : "";
+    if (code.length < MIN_SETUP_CODE || typeof given !== "string") {
+        return false;
+    }
+    const [a, b] = await Promise.all([sha256Hex(given.trim()), sha256Hex(code)]);
+    let diff = 0;
+    for (let i = 0; i < a.length; i++) {
+        diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    }
+    return diff === 0;
+}
+
+//! POST /api/signup {name, invite?, setupCode?}: name sign-in. The first account needs the setup
+//! code; after that you need a valid invite code (and you join its score). Refusals while the server
+//! has no owner say `setup: "needed"` (ask for the code) or `setup: "missing"` (none is set).
 export async function signup(request, env, config) {
     if (!config.authMethods.has("name")) {
         return fail(404, "not found");
@@ -38,7 +58,18 @@ export async function signup(request, env, config) {
         await env.DB.prepare("INSERT OR IGNORE INTO members (project_id, user_id, role, joined_at) VALUES (?, ?, 'editor', ?)")
             .bind(invite.project_id, created.userId, Date.now()).run();
     } else {
+        if (await env.DB.prepare("SELECT 1 FROM users LIMIT 1").first()) {
+            return fail(403, NEEDS_INVITE);
+        }
+        const setupSet = typeof env.SETUP_CODE === "string" && env.SETUP_CODE.trim().length >= MIN_SETUP_CODE;
+        if (!setupSet) {
+            return json({ error: NO_SETUP_CODE, setup: "missing" }, 403);
+        }
+        if (!(await isSetupCode(env, body.setupCode))) {
+            return json({ error: body.setupCode ? "That setup code isn't right." : NEEDS_SETUP_CODE, setup: "needed" }, 403);
+        }
         // Insert only while the table is empty, in one statement, so two first sign-ups can't both win.
+        // Once there is an account the setup code does nothing: it is used up.
         const userId = `u_${randomHex(12)}`;
         const res = await env.DB.prepare(
             "INSERT INTO users (id, name, created_at) SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM users)")

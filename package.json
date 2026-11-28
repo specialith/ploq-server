@@ -12,12 +12,19 @@
     "migrate": "wrangler d1 migrations apply DB --remote",
     "test": "node test/protocol.test.mjs",
     "test:unit": "node --test \"test/unit/**/*.test.mjs\"",
-    "test:server": "node scripts/test-fresh.mjs --test test/selfhost.test.mjs --port 8799 --url-var SELFHOST_URL",
+    "test:server": "node scripts/test-fresh.mjs --test test/selfhost.test.mjs --port 8799 --url-var SELFHOST_URL --var SETUP_CODE:test-setup-code --var SCORE_LIMIT:3 --var SERVER_SCORE_LIMIT:20",
     "test:protocol:dev": "node -e \"process.env.COLLAB_TEST_URL='ws://127.0.0.1:8799'; import('./test/protocol.test.mjs')\"",
     "test:worker": "node scripts/test-fresh.mjs --test test/protocol.test.mjs --port 8799 --url-var COLLAB_TEST_URL"
   },
   "devDependencies": {
     "wrangler": "4.167.0",
     "ws": "^8.23.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "SETUP_CODE": {
+        "description": "A code only you know, 8 characters or more. The first person to sign in on your new server needs it and becomes the owner. Afterwards it does nothing."
+      }
+    }
   }
 }

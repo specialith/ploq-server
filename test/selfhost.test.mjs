@@ -5,6 +5,7 @@
 // database. `npm run test:server` does that: it deletes .wrangler/test-8799,
 // migrates it, starts `wrangler dev` on 8799 with that data, runs this file and
 // stops the server. Running the file by hand against a used database fails.
+// It also sets SETUP_CODE=test-setup-code, SCORE_LIMIT=3 and SERVER_SCORE_LIMIT=20.
 //
 //   SELFHOST_URL (default http://127.0.0.1:8799)
 
@@ -42,8 +43,26 @@ test("signed out, /api/me is 401 and names the ways to sign in (for the sign-in 
     assert.deepEqual(r.data, { error: "Sign in first.", mode: "self-host", authMethods: ["name"] });
 });
 
-test("the first sign-up needs no invite and sets the session cookie", async () => {
-    const r = await call("/api/signup", { method: "POST", headers: SITE, body: { name: "Admin" } });
+test("the first sign-up needs the server's setup code", async () => {
+    // Otherwise whoever finds a new server before its deployer does becomes its owner.
+    // From another address: sign-ups are limited to 5 a minute from each.
+    const EARLY = { ...SITE, "CF-Connecting-IP": "10.50.0.1" };
+    const none = await call("/api/signup", { method: "POST", headers: EARLY, body: { name: "Early Bird" } });
+    assert.equal(none.status, 403);
+    assert.equal(none.data.setup, "needed");
+    assert.equal(none.setCookie, null);
+    const wrong = await call("/api/signup", { method: "POST", headers: EARLY, body: { name: "Early Bird", setupCode: "test-setup-cod" } });
+    assert.equal(wrong.status, 403);
+    assert.equal(wrong.data.setup, "needed");
+    assert.equal(wrong.data.error, "That setup code isn't right.");
+    // An invite that doesn't exist doesn't get around it.
+    const inv = await call("/api/signup", { method: "POST", headers: EARLY, body: { name: "Early Bird", invite: "0".repeat(24) } });
+    assert.equal(inv.status, 403);
+    assert.equal(inv.data.setup, "needed");
+});
+
+test("the first sign-up with the setup code makes the owner and sets the session cookie", async () => {
+    const r = await call("/api/signup", { method: "POST", headers: SITE, body: { name: "Admin", setupCode: " test-setup-code " } });
     assert.equal(r.status, 200);
     assert.equal(r.data.name, "Admin");
     assert.ok(r.data.token && r.data.userId);
@@ -53,10 +72,14 @@ test("the first sign-up needs no invite and sets the session cookie", async () =
     state.adminCookie = cookieOf(r.setCookie);
 });
 
-test("a second sign-up without an invite is refused", async () => {
+test("a second sign-up without an invite is refused, setup code or not", async () => {
     const r = await call("/api/signup", { method: "POST", headers: SITE, body: { name: "Mallory" } });
     assert.equal(r.status, 403);
     assert.equal(r.data.error, "You need an invite link to join this server.");
+    assert.equal(r.data.setup, undefined);
+    const again = await call("/api/signup", { method: "POST", headers: { ...SITE, "CF-Connecting-IP": "10.50.0.2" }, body: { name: "Mallory", setupCode: "test-setup-code" } });
+    assert.equal(again.status, 403);
+    assert.equal(again.data.error, "You need an invite link to join this server.");
     const bad = await call("/api/signup", { method: "POST", headers: SITE, body: { name: "Mallory", invite: "0".repeat(24) } });
     assert.equal(bad.status, 403);
 });
@@ -68,6 +91,7 @@ test("a sign-up with a valid invite joins that score", async () => {
     assert.equal(inv.status, 200);
     const r = await call("/api/signup", { method: "POST", headers: SITE, body: { name: "Bob", invite: inv.data.code } });
     assert.equal(r.status, 200);
+    state.bob = r.data;
     const list = await call("/api/projects", { token: r.data.token });
     assert.deepEqual(list.data.projects.map((x) => [x.projectId, x.role]), [[p.data.projectId, "editor"]]);
 });
@@ -166,7 +190,7 @@ test("sign-up and device links refuse requests that do not come from the site", 
     assert.equal((await call(`/api/device/${code}`, { method: "POST", headers: SITE })).status, 200);
 });
 
-test("there is no score limit, and /api/me has no plan", async () => {
+test("the server's owner has no score limit, and /api/me has no plan", async () => {
     const h = { Authorization: `Bearer ${state.admin.token}` };
     const PK = Buffer.concat([Buffer.from("PK"), Buffer.from("tiny score")]);
     const before = (await call("/api/projects", { headers: h })).data.projects.length;
@@ -190,4 +214,33 @@ test("a score's info names its owner", async () => {
     const one = await call(`/api/projects/${projectId}`, { headers: h });
     assert.deepEqual(Object.keys(one.data).sort(), ["ownerName", "projectId", "role", "title", "updatedAt"]);
     assert.equal(one.data.ownerName, "Live Lee");
+});
+
+test("an invited account can own SCORE_LIMIT scores", async () => {
+    const h = { Authorization: `Bearer ${state.bob.token}` };
+    const PK = Buffer.concat([Buffer.from("PK"), Buffer.from("tiny score")]);
+    for (let i = 0; i < 3; i++) {
+        assert.equal((await call("/api/projects", { method: "POST", token: state.bob.token, body: { title: `b${i}` } })).status, 200);
+    }
+    const over = await call("/api/projects", { method: "POST", token: state.bob.token, body: { title: "b3" } });
+    assert.equal(over.status, 402);
+    assert.equal(over.data.error, "You can own up to 3 scores on this server. Delete one to share another.");
+    const up = await fetch(`${base}/api/projects/upload?title=b4`, { method: "POST", headers: h, body: PK });
+    assert.equal(up.status, 402);
+    // The score it joined through the invite isn't its own and doesn't count.
+    const mine = (await call("/api/projects", { headers: h })).data.projects;
+    assert.equal(mine.filter((p) => p.role === "owner").length, 3);
+});
+
+test("the whole server holds at most SERVER_SCORE_LIMIT scores, the owner's too", async () => {
+    // The owner (no per-account limit) fills what's left.
+    let made = 0;
+    let r;
+    while ((r = await call("/api/projects", { method: "POST", token: state.admin.token, body: { title: `a${made}` } })).status === 200) {
+        made += 1;
+        assert.ok(made <= 20, "the server limit never stopped the owner");
+    }
+    assert.ok(made > 0);
+    assert.equal(r.status, 402);
+    assert.equal(r.data.error, "This server is full (20 scores). Ask its owner to make room.");
 });

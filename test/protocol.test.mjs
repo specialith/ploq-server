@@ -289,6 +289,11 @@ try {
         check(true, "the relay survives 'null' / '[]' / '42' / '\"hi\"' messages");
         check(!c.inbox.some(m => m.from !== undefined && m.type !== "cursor"),
               "the relay drops forged server messages (welcome, locks, presence); cursors still pass");
+        c.inbox.length = 0;
+        a.ws.send(JSON.stringify({ type: "cursor", page: 0, x: 9, y: 9, path: [0, 0, 1e15, 9, 9, 0], extra: "x" }));
+        const held = await waitFor(c.inbox, m => m.type === "cursor" && m.x === 9);
+        check(held.path === undefined && held.extra === undefined,
+              "the relay leaves out a cursor path timed far ahead (apps would queue it for good) and keys the apps don't use");
         c.ws.close();
     }
 
@@ -346,6 +351,30 @@ try {
         d.ws.close();
         b2.ws.close();
 
+        // An edit too big to keep in the log is refused before it gets a number: numbered, broadcast and
+        // acknowledged but not kept, a client catching up later skipped it without knowing.
+        const g = await open("Bob");
+        await waitFor(g.inbox, m => m.type === "welcome");
+        const seqBefore = ack42.seq;
+        const edit = (editId, xml) => JSON.stringify({ type: "edit", editId, tickFrom: 0, tickTo: 1920, staffFrom: 0, staffTo: 1, xml });
+        a.ws.send(edit(50, "x".repeat(1_900_000)));
+        const big = await waitFor(a.inbox, m => (m.type === "edit-rejected" || m.type === "ack") && m.editId === 50, 15000);
+        check(big.type === "edit-rejected" && big.reason === "too big", "an edit too big to store is refused ('too big'), not numbered");
+        a.ws.send(edit(51, "<small/>"));
+        const ack51 = await waitFor(a.inbox, m => m.type === "ack" && m.editId === 51, 15000);
+        await waitFor(g.inbox, m => m.type === "edit" && m.editId === 51);
+        check(ack51.seq === seqBefore + 1 && !g.inbox.some(m => m.type === "edit" && m.editId === 50),
+              "...nobody gets it, and the next edit takes the next number");
+        const h = await open("Carol");
+        await waitFor(h.inbox, m => m.type === "welcome");
+        h.ws.send(JSON.stringify({ type: "sync", sinceSeq: seqBefore }));
+        const caught = await waitFor(h.inbox, m => m.type === "synced", 15000);
+        const replayed = h.inbox.filter(m => m.type === "edit").map(m => m.seq);
+        check(caught.seq === seqBefore + 1 && JSON.stringify(replayed) === JSON.stringify([seqBefore + 1]),
+              "a client catching up gets every numbered edit, with no gaps");
+        h.ws.close();
+        g.ws.close();
+
         // #3: members can't forge server messages to each other.
         const fa = await open("Alice");
         const fb = await open("Bob");
@@ -391,6 +420,11 @@ try {
         fb.ws.send(JSON.stringify({ type: "cursor", page: 0, x: 7, y: 7 }));
         await waitFor(fa.inbox, m => m.type === "cursor" && m.x === 7);
         check(!fa.inbox.some(m => m.type === "cursor" && m.pad), "an oversized cursor message (70 KB) isn't passed on; normal ones are");
+        fa.inbox.length = 0;
+        fb.ws.send(JSON.stringify({ type: "cursor", page: 0, x: 9, y: 9, path: [0, 0, 1e15, 9, 9, 0], extra: "x" }));
+        const held = await waitFor(fa.inbox, m => m.type === "cursor" && m.x === 9);
+        check(held.path === undefined && held.extra === undefined && held.name === "Bob",
+              "a cursor path timed far ahead (apps would queue it for good) and keys the apps don't use aren't passed on");
         const bobKick = await api(`/api/projects/${mainProjectId}/members/${userIds.Alice}`, { method: "DELETE", token: tokens.Bob });
         check(bobKick.status === 403, "#5 an editor can't remove people");
 

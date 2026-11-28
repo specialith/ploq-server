@@ -58,19 +58,39 @@ async function removeProject(env, projectId) {
     ]);
 }
 
-//! Create a project and its owner row. A limit (hooks.projectLimit) is checked inside the INSERT
-//! itself (one statement), so parallel requests can't both take the last slot. The owner row is
-//! added in the same batch (a transaction), only if the project went in.
+//! Create a project and its owner row. Limits are checked inside the INSERT itself (one statement),
+//! so parallel requests can't both take the last slot. The owner row is added in the same batch (a
+//! transaction), only if the project went in.
+//! A deployment's hooks.projectLimit replaces the server's own limits; without it, config.scoreLimit
+//! applies to every account except the server's owner (its first account), and
+//! config.serverScoreLimit to the whole server.
 export async function createProject(env, config, user, title, hooks = {}) {
-    const limit = hooks.projectLimit ? hooks.projectLimit(user, config) : undefined;
+    const own = !hooks.projectLimit;
+    const limit = own ? config.scoreLimit : hooks.projectLimit(user, config);
+    const serverLimit = own ? config.serverScoreLimit : undefined;
     const projectId = `p_${randomHex(12)}`;
     const room = randomHex(16);
     const now = Date.now();
-    const limited = Number.isFinite(limit);
-    const insert = limited
+    const where = [];
+    const args = [];
+    if (Number.isFinite(limit)) {
+        const count = "(SELECT COUNT(*) FROM projects WHERE owner_id = ?) < ?";
+        if (own) {
+            where.push(`(? = (SELECT id FROM users ORDER BY created_at, rowid LIMIT 1) OR ${count})`);
+            args.push(user.id, user.id, limit);
+        } else {
+            where.push(count);
+            args.push(user.id, limit);
+        }
+    }
+    if (Number.isFinite(serverLimit)) {
+        where.push("(SELECT COUNT(*) FROM projects) < ?");
+        args.push(serverLimit);
+    }
+    const insert = where.length
         ? env.DB.prepare("INSERT INTO projects (id, owner_id, title, room, created_at, updated_at) "
-            + "SELECT ?, ?, ?, ?, ?, ? WHERE (SELECT COUNT(*) FROM projects WHERE owner_id = ?) < ?")
-            .bind(projectId, user.id, title, room, now, now, user.id, limit)
+            + `SELECT ?, ?, ?, ?, ?, ? WHERE ${where.join(" AND ")}`)
+            .bind(projectId, user.id, title, room, now, now, ...args)
         : env.DB.prepare("INSERT INTO projects (id, owner_id, title, room, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
             .bind(projectId, user.id, title, room, now, now);
     const results = await env.DB.batch([
@@ -79,7 +99,13 @@ export async function createProject(env, config, user, title, hooks = {}) {
             + "SELECT id, owner_id, 'owner', ? FROM projects WHERE id = ?").bind(now, projectId),
     ]);
     if (!results[0].meta.changes) {
-        return { error: hooks.limitError ? hooks.limitError(limit, config) : fail(402, "You can't own more scores.") };
+        if (!own) {
+            return { error: hooks.limitError ? hooks.limitError(limit, config) : fail(402, "You can't own more scores.") };
+        }
+        const total = Number.isFinite(serverLimit) && (await env.DB.prepare("SELECT COUNT(*) AS n FROM projects").first()).n;
+        return { error: Number.isFinite(serverLimit) && total >= serverLimit
+            ? fail(402, `This server is full (${serverLimit} scores). Ask its owner to make room.`)
+            : fail(402, `You can own up to ${limit} scores on this server. Delete one to share another.`) };
     }
     return { projectId, room, title };
 }

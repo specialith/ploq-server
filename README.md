@@ -20,7 +20,8 @@ You need a free [Cloudflare account](https://dash.cloudflare.com/sign-up) and a 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/specialith/ploq-server)
 
 1. Click the button and sign in to Cloudflare and GitHub when asked.
-2. Keep the suggested names (or change them) and click **Create and deploy**. Cloudflare copies
+2. It asks for a **SETUP_CODE**: make one up (8 characters or more) and keep it to yourself.
+   Keep the suggested names (or change them) and click **Create and deploy**. Cloudflare copies
    this repository to your GitHub, creates the database and the storage bucket, sets up the
    database, and puts the server online.
    - If it asks you to enable **R2** (Cloudflare's file storage, where the scores are kept), do
@@ -28,8 +29,9 @@ You need a free [Cloudflare account](https://dash.cloudflare.com/sign-up) and a 
      Cloudflare asks for a payment method before turning it on.
 3. When it's done, Cloudflare shows your server's address, something like
    `https://ploq-server.your-name.workers.dev`. Open it and check that the page loads.
-4. **Sign in first.** The first person to sign in on a new server becomes its owner. Everyone
-   after that needs an invite link to one of the owner's scores.
+4. **Sign in first.** Open the address, type your name, then the setup code when it asks. The
+   first account becomes the server's owner, and after that the code does nothing. Everyone
+   else needs an invite link to one of the owner's scores.
 5. Point Ploq at your server. Everyone who uses your server does this once: open **Command
    Prompt** (or PowerShell), run the line below with your server's address, then restart Ploq.
 
@@ -50,11 +52,13 @@ cd ploq-server
 npm install
 npx wrangler login
 npm run deploy
+npx wrangler secret put SETUP_CODE
 ```
 
 `npm run deploy` creates the database and the storage bucket on the first run, applies the
 database migrations, and prints your server's `workers.dev` address. Run it again after updating.
-Then follow steps 4 and 5 above.
+`wrangler secret put` asks for the setup code (8 characters or more). Then follow steps 4 and 5
+above.
 
 ### Your own domain (optional)
 
@@ -64,10 +68,19 @@ to `wrangler.jsonc` and deploy again, so invite links use it.
 
 ### Signing in
 
-People sign in with just a name. The first account on a server is its owner; everyone after
-that needs an invite link to one of the owner's scores. To sign in on another computer, open
+People sign in with just a name. The first account on a server is its owner and needs the setup
+code (the `SETUP_CODE` secret; set it in the Worker's **Settings > Variables and Secrets** if you
+didn't when deploying). Everyone after that needs an invite link to one of the owner's scores. To sign in on another computer, open
 **Your scores** on one where you're signed in and choose **Sign in on another computer**: it
 copies a one-time link that works for 15 minutes.
+
+### Score limits
+
+So nobody you invite can fill your Cloudflare storage, each invited account can own 20 scores and
+the whole server holds 500 (each score keeps at most about 18 MB, so 500 stay inside R2's free
+10 GB). The owner has no per-account limit. To change them, add vars to `wrangler.jsonc`, for
+example `"vars": { "SCORE_LIMIT": "50", "SERVER_SCORE_LIMIT": "1000" }` (a number, or
+`"unlimited"`), and deploy again.
 
 **https is required for the website.** The session cookie is `Secure`, which browsers keep only
 over https (or on `localhost` / `127.0.0.1`). `workers.dev` addresses and Cloudflare custom
@@ -95,7 +108,7 @@ JSON over HTTPS. `*` means signed in: the app sends `Authorization: Bearer <toke
 uses a session cookie.
 
 ```
-  POST   /api/signup                {name, invite?} -> {userId, name, token}  (sets cookie)
+  POST   /api/signup                {name, invite?, setupCode?} -> {userId, name, token}  (sets cookie)
   POST   /api/signout                    *        -> {} (this token stops working)
   POST   /api/device-link                 *        -> {url}  (one-time, 15 min)
   GET    /api/device/<code>                        -> {name, accountId}  (preview, no side effects)
@@ -154,13 +167,19 @@ npm test                # rooms and sync against the local relay (relay/), which
 
 ## Security notes
 
+- A new server's first account (its owner) needs the `SETUP_CODE` secret, so whoever finds the
+  server before you can't take it. Each invited account can own a limited number of scores and
+  the server holds a limited total (see Score limits).
 - Rooms only admit signed-in members of that score. Members are added through invite links, which
   only the owner can create. Owners can turn off links, remove members, and delete scores.
 - Sign-in tokens are random and only their SHA-256 is stored. They expire after 180 days.
 - Browser requests are only accepted from the site's own pages. The website runs under a strict
   nonce-based CSP.
-- The Room relays only `cursor` and `selection` between clients. All other client messages are
+- The Room relays only `cursor` and `selection` between clients, with only the fields the apps use,
+  checked (path points, times, coordinates, outline counts). All other client messages are
   handled by the server or dropped.
+- Every edit the Room numbers is kept until a newer saved score contains it, so a client catching up
+  never misses one; an edit too big to keep is refused before it gets a number.
 - Rate limits cover sign-up, sign-in codes and device links, and changes.
 
 Found a security problem? Please report it privately through GitHub's

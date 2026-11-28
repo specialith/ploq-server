@@ -11,6 +11,7 @@
 // Messages are JSON text frames. See docs/collab/PROTOCOL.md in ploq-app.
 
 import { WebSocketServer } from "ws";
+import { cleanPresence } from "../src/presence.js";
 
 const port = Number(process.argv[2] || process.env.COLLAB_PORT || 8787);
 
@@ -135,12 +136,17 @@ function handleMessage(ws, room, roomName, client, msg) {
     }
 
     case "cursor":
-    case "selection":
+    case "selection": {
         // The only client-to-client messages, as on the Cloudflare server.
         // Forwarding anything else let a client forge server messages
-        // (welcome, presence, snapshot) to everyone else.
-        broadcast(room, { ...msg, from: client.id, name: client.name }, ws);
+        // (welcome, presence, snapshot) to everyone else. Checked the same
+        // way as there (src/presence.js).
+        const clean = cleanPresence(msg);
+        if (clean) {
+            broadcast(room, { ...clean, from: client.id, name: client.name }, ws);
+        }
         break;
+    }
 
     default:
         break;
